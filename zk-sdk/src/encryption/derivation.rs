@@ -127,6 +127,14 @@ pub fn derive_confidential_keys_from_signature(
 /// ECDSA signer); the EVM `personal_sign` EIP-191 prefixing is transparent here
 /// because we hash the resulting signature, not the message.
 ///
+/// Why hash, when [`derive_confidential_keys_from_signature`] feeds an Ed25519
+/// signature raw? Not for added strength: HKDF-Extract already runs HMAC over
+/// the IKM. The SHA-512 normalizes any ECDSA signature (curve- and encoding-dependent
+/// length) to a fixed 64-byte IKM, keeps the adapter curve-agnostic, and clears
+/// the spine's minimum-IKM floor. The Ed25519 raw path is the documented legacy
+/// exception, locked to byte-exact behavior by already-provisioned accounts;
+/// new signature adapters hash.
+///
 /// Determinism note: ECDSA is malleable, both `s` and `n - s` are valid, so the
 /// caller MUST supply a low-S, RFC 6979 deterministic signature or the derived
 /// keys will differ between sessions and orphan the balance. This adapter does
