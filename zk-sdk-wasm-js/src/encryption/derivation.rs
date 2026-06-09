@@ -3,13 +3,14 @@ use {
     js_sys::Uint8Array,
     solana_signature::Signature,
     solana_zk_sdk::encryption::derivation::{
-        confidential_derivation_message, derive_confidential_keys_from_ikm,
-        derive_confidential_keys_from_signature,
+        confidential_derivation_message, derive_confidential_keys_from_ecdsa_signature,
+        derive_confidential_keys_from_ikm, derive_confidential_keys_from_signature,
     },
     wasm_bindgen::prelude::{wasm_bindgen, JsValue},
 };
 
-/// Byte length of an ed25519 signature.
+/// Byte length of an ed25519 signature, and of a compact `r || s` ECDSA
+/// signature (recovery byte stripped).
 const SIGNATURE_LEN: usize = 64;
 
 /// Accepted byte lengths for a WebAuthn PRF output: 32 bytes for a single
@@ -74,6 +75,34 @@ impl ConfidentialKeys {
         let signature = Signature::from(bytes);
 
         derive_confidential_keys_from_signature(&signature)
+            .map(|(elgamal, ae)| Self {
+                elgamal: elgamal.into(),
+                ae: ae.into(),
+            })
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Derives a `ConfidentialKeys` pair from a 64-byte compact (`r || s`)
+    /// deterministic ECDSA signature over `signerMessage` (the secp256k1 / EVM
+    /// adapter).
+    ///
+    /// Strip the recovery byte `v` before calling, e.g. `sig.slice(0, 64)` on a
+    /// 65-byte `personal_sign` result. The signature MUST be low-S and RFC 6979
+    /// deterministic or the derived keys will not be reproducible; see the core
+    /// `derive_confidential_keys_from_ecdsa_signature` docs for the rationale.
+    #[wasm_bindgen(js_name = "fromEcdsaSignature")]
+    pub fn from_ecdsa_signature(signature: Uint8Array) -> Result<ConfidentialKeys, JsValue> {
+        if signature.length() as usize != SIGNATURE_LEN {
+            return Err(JsValue::from_str(&format!(
+                "Invalid ECDSA signature length: expected {} (compact r||s), got {}",
+                SIGNATURE_LEN,
+                signature.length()
+            )));
+        }
+        let mut bytes = [0u8; SIGNATURE_LEN];
+        signature.copy_to(&mut bytes);
+
+        derive_confidential_keys_from_ecdsa_signature(&bytes)
             .map(|(elgamal, ae)| Self {
                 elgamal: elgamal.into(),
                 ae: ae.into(),
@@ -289,5 +318,50 @@ mod tests {
         assert!(ConfidentialKeys::from_prf(Uint8Array::from(zero_32.as_slice())).is_err());
         let zero_64 = vec![0u8; 64];
         assert!(ConfidentialKeys::from_prf(Uint8Array::from(zero_64.as_slice())).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_from_ecdsa_signature_determinism() {
+        let sig_bytes = [4u8; 64];
+        let sig = Uint8Array::from(sig_bytes.as_ref());
+
+        let keys_a = ConfidentialKeys::from_ecdsa_signature(sig.clone()).unwrap();
+        let keys_b = ConfidentialKeys::from_ecdsa_signature(sig).unwrap();
+        assert_eq!(
+            keys_a.elgamal().secret().to_bytes(),
+            keys_b.elgamal().secret().to_bytes()
+        );
+        assert_eq!(keys_a.ae().to_bytes(), keys_b.ae().to_bytes());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_from_ecdsa_signature_rejects_wrong_length() {
+        let short = vec![1u8; 63];
+        assert!(
+            ConfidentialKeys::from_ecdsa_signature(Uint8Array::from(short.as_slice())).is_err()
+        );
+        let long = vec![1u8; 65];
+        assert!(ConfidentialKeys::from_ecdsa_signature(Uint8Array::from(long.as_slice())).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_from_ecdsa_signature_rejects_all_zero() {
+        let zero = vec![0u8; 64];
+        assert!(ConfidentialKeys::from_ecdsa_signature(Uint8Array::from(zero.as_slice())).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_from_ecdsa_signature_hashes_unlike_from_ikm() {
+        // The ECDSA adapter hashes the signature (SHA-512) before the spine,
+        // unlike `fromIkm` which consumes the bytes directly, so the two must
+        // disagree over identical input.
+        let bytes = [6u8; 64];
+        let from_ecdsa =
+            ConfidentialKeys::from_ecdsa_signature(Uint8Array::from(bytes.as_ref())).unwrap();
+        let from_ikm = ConfidentialKeys::from_ikm(Uint8Array::from(bytes.as_ref())).unwrap();
+        assert_ne!(
+            from_ecdsa.elgamal().secret().to_bytes(),
+            from_ikm.elgamal().secret().to_bytes()
+        );
     }
 }
