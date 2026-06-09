@@ -43,7 +43,7 @@ use {
     },
     curve25519_dalek::scalar::Scalar,
     hkdf::Hkdf,
-    sha2::Sha512,
+    sha2::{Digest, Sha512},
     solana_signature::Signature,
     solana_signer::Signer,
     solana_zk_sdk_pod::encryption::AE_KEY_LEN,
@@ -116,6 +116,33 @@ pub fn derive_confidential_keys_from_signature(
         return Err(ElGamalError::DefaultSignatureRejected);
     }
     derive_confidential_keys_from_ikm(signature.as_ref())
+}
+
+/// Derives the confidential-balances key pair from a deterministic ECDSA
+/// signature over the canonical derivation message, hashing it into input key
+/// material per the sRFC ECDSA adapter (`IKM = SHA-512(signature)`).
+///
+/// `signature` is the 64-byte compact `r || s` form with any recovery byte
+/// stripped. Intended for secp256k1 EVM wallets (and any RFC 6979 deterministic
+/// ECDSA signer); the EVM `personal_sign` EIP-191 prefixing is transparent here
+/// because we hash the resulting signature, not the message.
+///
+/// Determinism note: ECDSA is malleable, both `s` and `n - s` are valid, so the
+/// caller MUST supply a low-S, RFC 6979 deterministic signature or the derived
+/// keys will differ between sessions and orphan the balance. This adapter does
+/// not normalize: low-S only closes the narrow high-S gap, while nonce
+/// determinism must be trusted regardless (a random nonce changes `r` too, which
+/// no normalization recovers). This is the same trust model as the Ed25519 path.
+/// Modern EVM wallets emit low-S per EIP-2. Verify determinism by test against
+/// the real signer.
+pub fn derive_confidential_keys_from_ecdsa_signature(
+    signature: &[u8; 64],
+) -> Result<(ElGamalKeypair, AeKey), ElGamalError> {
+    if signature.iter().fold(0u8, |acc, &b| acc | b) == 0 {
+        return Err(ElGamalError::DefaultSignatureRejected);
+    }
+    let ikm = Sha512::digest(signature);
+    derive_confidential_keys_from_ikm(&ikm)
 }
 
 /// Derives the confidential-balances key pair from raw input key material.
@@ -320,5 +347,45 @@ mod tests {
         // silently producing predictable keys.
         let null_signer = NullSigner::new(&solana_address::Address::default());
         assert!(derive_confidential_keys(&null_signer, &[0x11u8; 32]).is_err());
+    }
+
+    #[test]
+    fn test_derive_confidential_keys_from_ecdsa_signature_determinism() {
+        let sig = [0x42u8; 64];
+        let (kp_a, ae_a) = derive_confidential_keys_from_ecdsa_signature(&sig).unwrap();
+        let (kp_b, ae_b) = derive_confidential_keys_from_ecdsa_signature(&sig).unwrap();
+        assert_eq!(kp_a.secret().as_bytes(), kp_b.secret().as_bytes());
+        assert_eq!(
+            <[u8; AE_KEY_LEN]>::from(&ae_a),
+            <[u8; AE_KEY_LEN]>::from(&ae_b)
+        );
+    }
+
+    #[test]
+    fn test_derive_confidential_keys_from_ecdsa_signature_hashes_input() {
+        // The ECDSA adapter hashes the signature into IKM (`SHA-512(sig)`),
+        // unlike the Ed25519 path which feeds the raw signature. This is the
+        // sRFC interop contract, so assert byte-equality with the explicit
+        // `from_ikm(SHA-512(sig))` and that it differs from the raw-sig path.
+        let sig = [0x37u8; 64];
+        let (kp_ecdsa, ae_ecdsa) = derive_confidential_keys_from_ecdsa_signature(&sig).unwrap();
+
+        let (kp_hashed, ae_hashed) =
+            derive_confidential_keys_from_ikm(&Sha512::digest(sig)).unwrap();
+        assert_eq!(kp_ecdsa.secret().as_bytes(), kp_hashed.secret().as_bytes());
+        assert_eq!(
+            <[u8; AE_KEY_LEN]>::from(&ae_ecdsa),
+            <[u8; AE_KEY_LEN]>::from(&ae_hashed)
+        );
+
+        let (kp_raw, _) = derive_confidential_keys_from_ikm(&sig).unwrap();
+        assert_ne!(kp_ecdsa.secret().as_bytes(), kp_raw.secret().as_bytes());
+    }
+
+    #[test]
+    fn test_derive_confidential_keys_from_ecdsa_signature_rejects_all_zero() {
+        let sig = [0u8; 64];
+        let err = derive_confidential_keys_from_ecdsa_signature(&sig).unwrap_err();
+        assert!(matches!(err, ElGamalError::DefaultSignatureRejected));
     }
 }

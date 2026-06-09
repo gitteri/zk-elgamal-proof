@@ -1,4 +1,4 @@
-1007
+1016
 config
 metadata
 json
@@ -92,6 +92,15 @@ passkey/S
 bundler/S
 iOS
 AWS
+secp256k1
+EVM
+ETH
+EIP
+Trezor
+MetaMask
+viem
+ethers
+sRFC
 crypto
 pseudorandom
 reimplementations

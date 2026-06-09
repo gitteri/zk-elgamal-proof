@@ -38,9 +38,10 @@ There is one entry point per source of key material. Pick the one that matches h
 |---|---|---|
 | WebAuthn passkey | `prfInput` + `fromPrf` | the only viable path for passkeys |
 | Ed25519 wallet signature | `signerMessage` + `fromSignature` | today's universal wallet path |
+| ECDSA secp256k1 (EVM) signature | `signerMessage` + `fromEcdsaSignature` | EVM wallets, Ledger ETH, Trezor |
 | Raw input key material | `fromIkm` | Secure Enclave / KMS HMAC, BIP39 seed, etc. |
 
-All three converge on the same spine, so `fromSignature(sig)`, `fromIkm(bytes)`, and `fromPrf(out)` over the same bytes produce identical keys.
+They converge on the same spine: `fromSignature(sig)`, `fromIkm(bytes)`, and `fromPrf(out)` over the same bytes produce identical keys. `fromEcdsaSignature` is the exception, it hashes the signature (`SHA-512`) before the spine, so it does not coincide with `fromIkm` over the same bytes.
 
 ```js
 const keys = ConfidentialKeys.fromPrf(prfOutput);
@@ -101,6 +102,27 @@ const keys = ConfidentialKeys.fromSignature(signature);
 ```
 
 The all-zero (default) signature is rejected: some signers return it instead of raising an error, and the resulting keys would be predictable.
+
+### ECDSA secp256k1 (EVM wallets)
+
+For an EVM wallet bridging to Solana, Ledger's ETH app, or Trezor secp256k1, derive from a deterministic ECDSA signature over the same canonical message. The wallet's `personal_sign` wraps it in the EIP-191 prefix and signs; that prefixing is transparent here because the SDK hashes the resulting signature, not the message.
+
+```js
+import { ConfidentialKeys } from "@solana/zk-sdk/web";
+
+const message = ConfidentialKeys.signerMessage(tokenAccount.toBytes());
+
+// personal_sign returns a 65-byte r||s||v hex string; drop the recovery byte.
+const hex = await ethProvider.request({
+  method: "personal_sign",
+  params: [bytesToHex(message), account],
+});
+const compact = hexToBytes(hex).slice(0, 64); // r || s, strip v
+
+const keys = ConfidentialKeys.fromEcdsaSignature(compact);
+```
+
+The signature MUST be low-S and RFC 6979 deterministic, or the derived keys will not be reproducible and the balance is orphaned. ECDSA is malleable (`s` and `n - s` are both valid), so byte-exact determinism matters. The SDK does not normalize: low-S only closes the narrow high-S gap, while nonce determinism must be trusted regardless. Modern EVM wallets (MetaMask, ethers, viem, Ledger) emit low-S per EIP-2; verify determinism by test against your actual signer before provisioning.
 
 ### Raw input key material
 
